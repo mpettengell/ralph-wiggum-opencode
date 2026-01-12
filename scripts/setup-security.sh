@@ -290,6 +290,261 @@ systemctl enable docker-firewall 2>/dev/null || true
 log "Docker firewall service created and enabled"
 
 # ============================================================================
+# STEP 4c: k3s and Docker Compose Firewall Fix (CRITICAL)
+# ============================================================================
+
+echo ""
+echo "Step 4c: k3s and Docker Compose Firewall Fix (CRITICAL)"
+echo "─────────────────────────────────────"
+
+# Both k3s and docker-compose can bypass firewall rules!
+
+# Create k3s firewall script
+cat > /usr/local/bin/k3s-firewall-fix <<'K3SFW'
+#!/bin/bash
+set -euo pipefail
+
+# CRITICAL: k3s manipulates iptables for service networking
+# Use K3S-FIREWALL chain to block networks before k3s sees them
+
+# Create K3S-FIREWALL chain
+iptables -N K3S-FIREWALL 2>/dev/null || iptables -F K3S-FIREWALL
+
+# Block production networks (customize these!)
+BLOCKED_NETWORKS=(
+  "10.0.1.0/24"      # Production network - CUSTOMIZE!
+  "172.16.0.0/12"    # Private network class B
+  "192.168.0.0/16"   # Private network class C
+)
+
+echo "Applying K3S-FIREWALL rules..."
+
+for network in "${BLOCKED_NETWORKS[@]}"; do
+  # Block incoming from these networks to k3s services
+  iptables -I K3S-FIREWALL -s "$network" -j DROP
+
+  # Block outgoing from k3s pods to these networks
+  iptables -I K3S-FIREWALL -d "$network" -j DROP
+
+  echo "  Blocked k3s traffic to/from: $network"
+done
+
+# Log blocked attempts
+iptables -A K3S-FIREWALL -m limit --limit 5/min -j LOG --log-prefix "K3S-BLOCKED: " --log-level 4
+
+# Insert into FORWARD chain (for pod traffic)
+iptables -I FORWARD -j K3S-FIREWALL 2>/dev/null || true
+
+# Insert into INPUT chain (for NodePort access)
+iptables -I INPUT -j K3S-FIREWALL 2>/dev/null || true
+
+echo "✅ k3s firewall rules applied"
+echo ""
+echo "⚠️  Remember: These rules apply to k3s pods and services"
+echo "   Use NetworkPolicies within k3s for additional control"
+K3SFW
+
+chmod +x /usr/local/bin/k3s-firewall-fix
+
+log "k3s firewall fix script created"
+
+# Create docker-compose validation wrapper
+cat > /usr/local/bin/docker-compose-safe <<'COMPSAFE'
+#!/bin/bash
+set -euo pipefail
+
+COMPOSE_FILE="${1:-docker-compose.yml}"
+
+if [[ ! -f "$COMPOSE_FILE" ]]; then
+  echo "ERROR: Compose file not found: $COMPOSE_FILE" >&2
+  exit 1
+fi
+
+echo "🔍 Validating $COMPOSE_FILE for security issues..."
+
+# Check for host network mode (bypasses all isolation)
+if grep -q "network_mode.*host" "$COMPOSE_FILE"; then
+  echo "❌ ERROR: network_mode: host is not allowed" >&2
+  echo "   This bypasses all network isolation" >&2
+  exit 1
+fi
+
+# Check for privileged containers
+if grep -q "privileged.*true" "$COMPOSE_FILE"; then
+  echo "❌ ERROR: privileged: true is not allowed" >&2
+  exit 1
+fi
+
+# Check for port bindings without localhost
+if grep -E "ports:.*\"[0-9]+:[0-9]+" "$COMPOSE_FILE" | grep -qv "127.0.0.1"; then
+  echo "⚠️  WARNING: Port binding without localhost restriction detected" >&2
+  echo "   Current bindings:" >&2
+  grep -E "ports:" "$COMPOSE_FILE" | head -5 >&2
+  echo "   Recommended format: \"127.0.0.1:8080:80\"" >&2
+  echo "" >&2
+
+  read -p "Continue anyway? [y/N] " -n 1 -r
+  echo
+  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    exit 1
+  fi
+fi
+
+# Check for sensitive volume mounts
+if grep -E "volumes:.*/(etc|root|sys|proc)" "$COMPOSE_FILE"; then
+  echo "❌ ERROR: Volume mount to sensitive directory detected" >&2
+  grep -E "volumes:.*/(etc|root|sys|proc)" "$COMPOSE_FILE" >&2
+  exit 1
+fi
+
+echo "✅ Security validation passed"
+
+# Run docker-compose with validated file
+exec docker-compose -f "$COMPOSE_FILE" "${@:2}"
+COMPSAFE
+
+chmod +x /usr/local/bin/docker-compose-safe
+
+log "docker-compose validation wrapper created"
+
+# Create secure docker-compose template
+mkdir -p /usr/local/share/ralph
+
+cat > /usr/local/share/ralph/docker-compose.template.yml <<'TEMPLATE'
+version: '3.8'
+
+# SECURE TEMPLATE for Ralph projects
+# ===================================
+# Security features:
+# - Ports bind to 127.0.0.1 only (not accessible from network)
+# - Internal networks by default (no external access)
+# - No privileged containers
+# - Dropped capabilities (least privilege)
+# - Read-only root filesystem where possible
+
+services:
+  # Example application service
+  app:
+    image: nginx:alpine
+    ports:
+      # ✅ CORRECT: Bind to localhost only
+      - "127.0.0.1:8080:80"
+
+      # ❌ WRONG: Binds to all interfaces (0.0.0.0)
+      # - "8080:80"
+
+    networks:
+      - internal
+
+    # Security hardening
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    cap_add:
+      - NET_BIND_SERVICE  # Only if needed for port < 1024
+
+    read_only: true
+
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
+
+    restart: unless-stopped
+
+  # Example database service
+  db:
+    image: postgres:15-alpine
+
+    # ✅ CORRECT: No ports exposed to host
+    # Only accessible via internal network from app service
+
+    networks:
+      - internal
+
+    volumes:
+      # ✅ CORRECT: Only mount workspace subdirectories
+      - ./data:/var/lib/postgresql/data
+
+      # ❌ WRONG: System directory mounts
+      # - /etc:/host-etc
+
+    environment:
+      POSTGRES_PASSWORD: dev-password-change-me
+      POSTGRES_USER: devuser
+      POSTGRES_DB: devdb
+
+    security_opt:
+      - no-new-privileges:true
+
+    restart: unless-stopped
+
+networks:
+  # Internal network: no external connectivity
+  internal:
+    driver: bridge
+    internal: true  # Prevents external access
+    ipam:
+      config:
+        - subnet: 172.30.1.0/24
+
+  # If you need external access (e.g., API calls), use a separate network
+  # and explicitly connect only services that need it
+  # external:
+  #   driver: bridge
+  #   ipam:
+  #     config:
+  #       - subnet: 172.30.2.0/24
+
+volumes:
+  # Named volumes for persistent data
+  db_data:
+    driver: local
+TEMPLATE
+
+log "Secure docker-compose template created"
+
+# Create systemd service for k3s firewall
+cat > /etc/systemd/system/k3s-firewall.service <<'EOF'
+[Unit]
+Description=k3s Firewall Rules (K3S-FIREWALL chain)
+After=network.target
+Before=k3s.service
+ConditionPathExists=/usr/local/bin/k3s-firewall-fix
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/k3s-firewall-fix
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable k3s-firewall 2>/dev/null || true
+
+log "k3s firewall service created and enabled"
+
+# Apply k3s rules if k3s is already installed
+if command -v k3s >/dev/null 2>&1; then
+  warn "k3s is installed. Applying K3S-FIREWALL rules..."
+  /usr/local/bin/k3s-firewall-fix || warn "k3s firewall rules failed (may need iptables modules)"
+  log "K3S-FIREWALL rules applied"
+else
+  log "k3s not installed yet. Rules will apply when k3s starts."
+fi
+
+# Create alias for docker-compose-safe (optional)
+if ! grep -q "docker-compose-safe" /home/$RALPH_USER/.bashrc 2>/dev/null; then
+  su - $RALPH_USER -c "echo 'alias docker-compose-safe=/usr/local/bin/docker-compose-safe' >> ~/.bashrc" || true
+  log "Added docker-compose-safe alias for $RALPH_USER"
+fi
+
+# ============================================================================
 # STEP 5: Resource Limits (cgroups)
 # ============================================================================
 
@@ -644,6 +899,9 @@ echo "  ✅ Workspace validation"
 echo "  ✅ Emergency kill switch"
 echo "  ✅ Docker firewall fix (DOCKER-USER chain)"
 echo "  ✅ Rootless Docker for $RALPH_USER"
+echo "  ✅ k3s firewall fix (K3S-FIREWALL chain)"
+echo "  ✅ docker-compose validation wrapper"
+echo "  ✅ Secure docker-compose template"
 echo ""
 echo "⚠️  Manual Steps Required:"
 echo "  1. Review and apply firewall rules:"
@@ -653,19 +911,24 @@ echo "  2. Review Docker firewall rules (CRITICAL):"
 echo "     nano /usr/local/bin/docker-firewall-fix  # Customize networks"
 echo "     /usr/local/bin/docker-firewall-fix       # Apply rules"
 echo ""
-echo "  3. Verify Docker firewall:"
-echo "     iptables -L DOCKER-USER -n -v"
+echo "  3. Review k3s firewall rules (CRITICAL):"
+echo "     nano /usr/local/bin/k3s-firewall-fix     # Customize networks"
+echo "     /usr/local/bin/k3s-firewall-fix          # Apply if k3s installed"
+echo ""
+echo "  4. Verify firewalls:"
+echo "     iptables -L DOCKER-USER -n -v    # Docker"
+echo "     iptables -L K3S-FIREWALL -n -v   # k3s"
 echo "     su - $RALPH_USER -c 'docker ps'  # Test rootless Docker"
 echo ""
-echo "  4. Install Ralph for the ralph user:"
+echo "  5. Install Ralph for the ralph user:"
 echo "     su - $RALPH_USER"
 echo "     curl -fsSL https://raw.githubusercontent.com/agrimsingh/ralph-wiggum-opencode/main/install.sh | bash"
 echo ""
-echo "  5. Create a test project:"
+echo "  6. Create a test project:"
 echo "     mkdir -p $WORKSPACE_BASE/test-project"
 echo "     chown $RALPH_USER:$RALPH_USER $WORKSPACE_BASE/test-project"
 echo ""
-echo "  6. Configure RALPH_TASK.md in your project workspace"
+echo "  7. Configure RALPH_TASK.md in your project workspace"
 echo ""
 echo "Usage:"
 echo "  ralph-run <project-name>"

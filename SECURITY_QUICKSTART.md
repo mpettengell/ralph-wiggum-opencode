@@ -34,16 +34,24 @@ exit
 nano /usr/local/bin/docker-firewall-fix  # Customize your networks
 /usr/local/bin/docker-firewall-fix
 
-# Verify Docker firewall
-iptables -L DOCKER-USER -n -v
+# 7. CRITICAL: Apply k3s firewall fix
+#    k3s also bypasses iptables rules for service networking!
+nano /usr/local/bin/k3s-firewall-fix     # Customize your networks
+/usr/local/bin/k3s-firewall-fix          # Apply if k3s installed
 
-# 7. Create baseline snapshot
+# Verify firewalls
+iptables -L DOCKER-USER -n -v   # Docker
+iptables -L K3S-FIREWALL -n -v  # k3s
+
+# 8. Create baseline snapshot
 # (On hypervisor: qm snapshot <vmid> ralph-baseline)
 ```
 
 **Done!** Now you can safely run Ralph.
 
-> **⚠️ CRITICAL**: Always apply the Docker firewall fix! Docker automatically bypasses standard iptables rules when forwarding ports. See `docs/DOCKER_FIREWALL_FIX.md` for details.
+> **⚠️ CRITICAL**: Always apply Docker AND k3s firewall fixes! Both Docker and k3s automatically bypass standard iptables rules when forwarding ports or managing service networking. See:
+> - `docs/DOCKER_FIREWALL_FIX.md` for Docker details
+> - `docs/K3S_COMPOSE_FIREWALL_FIX.md` for k3s and docker-compose details
 
 ---
 
@@ -107,7 +115,12 @@ pkill -u ralph
 
 ## 🔒 Security Controls Active
 
-> **⚠️ CRITICAL**: Docker bypasses iptables OUTPUT rules! You MUST apply the DOCKER-USER firewall rules. See step 6 in Quick Setup or read `docs/DOCKER_FIREWALL_FIX.md`.
+> **⚠️ CRITICAL**: Docker, k3s, and docker-compose can bypass iptables OUTPUT rules! You MUST apply ALL firewall fixes:
+> - Step 6: DOCKER-USER chain (`/usr/local/bin/docker-firewall-fix`)
+> - Step 7: K3S-FIREWALL chain (`/usr/local/bin/k3s-firewall-fix`)
+> - Use `docker-compose-safe` wrapper for validation
+>
+> See `docs/DOCKER_FIREWALL_FIX.md` and `docs/K3S_COMPOSE_FIREWALL_FIX.md` for details.
 
 ### ✅ What's Protected
 
@@ -118,6 +131,8 @@ pkill -u ralph
 | **Resource Limits** | Max 80% CPU, 12GB RAM, 500 processes |
 | **Network Isolation** | Blocked from production networks |
 | **Docker Isolation** | DOCKER-USER chain + rootless Docker |
+| **k3s Isolation** | K3S-FIREWALL chain blocks pod/service traffic |
+| **docker-compose Validation** | Wrapper prevents unsafe configurations |
 | **Filesystem Protection** | Cannot access `/etc`, `/root`, system dirs |
 | **Audit Logging** | All actions logged |
 | **Emergency Stop** | One-command killswitch |
@@ -412,7 +427,10 @@ Ralph VM Internal:
 | **Check resources** | `systemd-cgtop` |
 | **View logs** | `tail -f /var/log/ralph-sessions.log` |
 | **Apply Docker firewall** | `/usr/local/bin/docker-firewall-fix` |
+| **Apply k3s firewall** | `/usr/local/bin/k3s-firewall-fix` |
 | **Check Docker rules** | `iptables -L DOCKER-USER -n -v` |
+| **Check k3s rules** | `iptables -L K3S-FIREWALL -n -v` |
+| **Validate compose file** | `docker-compose-safe -f docker-compose.yml config` |
 | **Test security** | `/usr/local/bin/test-ralph-security` |
 | **Apply firewall** | `/usr/local/bin/ralph-firewall` |
 | **Create snapshot** | `qm snapshot <vmid> <name>` (on hypervisor) |
