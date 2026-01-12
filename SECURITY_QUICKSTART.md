@@ -29,11 +29,21 @@ exit
 # 5. Apply firewall rules (review first!)
 /usr/local/bin/ralph-firewall
 
-# 6. Create baseline snapshot
+# 6. CRITICAL: Apply Docker firewall fix
+#    Docker bypasses iptables rules when forwarding ports!
+nano /usr/local/bin/docker-firewall-fix  # Customize your networks
+/usr/local/bin/docker-firewall-fix
+
+# Verify Docker firewall
+iptables -L DOCKER-USER -n -v
+
+# 7. Create baseline snapshot
 # (On hypervisor: qm snapshot <vmid> ralph-baseline)
 ```
 
 **Done!** Now you can safely run Ralph.
+
+> **⚠️ CRITICAL**: Always apply the Docker firewall fix! Docker automatically bypasses standard iptables rules when forwarding ports. See `docs/DOCKER_FIREWALL_FIX.md` for details.
 
 ---
 
@@ -97,6 +107,8 @@ pkill -u ralph
 
 ## 🔒 Security Controls Active
 
+> **⚠️ CRITICAL**: Docker bypasses iptables OUTPUT rules! You MUST apply the DOCKER-USER firewall rules. See step 6 in Quick Setup or read `docs/DOCKER_FIREWALL_FIX.md`.
+
 ### ✅ What's Protected
 
 | Control | Protection |
@@ -105,6 +117,7 @@ pkill -u ralph
 | **Workspace Isolation** | Only access to `/ralph-workspaces/*` |
 | **Resource Limits** | Max 80% CPU, 12GB RAM, 500 processes |
 | **Network Isolation** | Blocked from production networks |
+| **Docker Isolation** | DOCKER-USER chain + rootless Docker |
 | **Filesystem Protection** | Cannot access `/etc`, `/root`, system dirs |
 | **Audit Logging** | All actions logged |
 | **Emergency Stop** | One-command killswitch |
@@ -398,6 +411,8 @@ Ralph VM Internal:
 | **Monitor** | `tail -f /ralph-workspaces/<project>/.ralph/activity.log` |
 | **Check resources** | `systemd-cgtop` |
 | **View logs** | `tail -f /var/log/ralph-sessions.log` |
+| **Apply Docker firewall** | `/usr/local/bin/docker-firewall-fix` |
+| **Check Docker rules** | `iptables -L DOCKER-USER -n -v` |
 | **Test security** | `/usr/local/bin/test-ralph-security` |
 | **Apply firewall** | `/usr/local/bin/ralph-firewall` |
 | **Create snapshot** | `qm snapshot <vmid> <name>` (on hypervisor) |

@@ -152,6 +152,144 @@ warn "Review /usr/local/bin/ralph-firewall and run manually"
 warn "This prevents accidental network disruption"
 
 # ============================================================================
+# STEP 4b: Docker Firewall Fix (CRITICAL)
+# ============================================================================
+
+echo ""
+echo "Step 4b: Docker Firewall Fix (CRITICAL)"
+echo "─────────────────────────────────────"
+
+# Docker bypasses iptables rules when forwarding ports!
+# We need to use DOCKER-USER chain and rootless Docker
+
+# Create DOCKER-USER firewall script
+cat > /usr/local/bin/docker-firewall-fix <<'DCKRFW'
+#!/bin/bash
+set -euo pipefail
+
+# CRITICAL: Docker bypasses OUTPUT rules with DOCKER chain
+# Use DOCKER-USER chain to block networks before Docker sees them
+
+# Ensure DOCKER-USER chain exists
+iptables -N DOCKER-USER 2>/dev/null || iptables -F DOCKER-USER
+
+# Block production networks (customize these!)
+BLOCKED_NETWORKS=(
+  "10.0.1.0/24"      # Production network - CUSTOMIZE!
+  "172.16.0.0/12"    # Private network class B
+  "192.168.0.0/16"   # Private network class C
+)
+
+echo "Applying DOCKER-USER firewall rules..."
+
+for network in "${BLOCKED_NETWORKS[@]}"; do
+  # Block incoming from these networks to Docker containers
+  iptables -I DOCKER-USER -s "$network" -j DROP
+
+  # Block outgoing from Docker containers to these networks
+  iptables -I DOCKER-USER -d "$network" -j DROP
+
+  echo "  Blocked Docker traffic to/from: $network"
+done
+
+# Log blocked attempts
+iptables -A DOCKER-USER -m limit --limit 5/min -j LOG --log-prefix "DOCKER-BLOCKED: " --log-level 4
+
+# Accept everything else (Docker will handle the rest)
+iptables -A DOCKER-USER -j RETURN
+
+echo "✅ Docker firewall rules applied"
+echo ""
+echo "⚠️  Remember: These rules apply to Docker containers"
+echo "   Rootless Docker (for ralph user) provides additional isolation"
+DCKRFW
+
+chmod +x /usr/local/bin/docker-firewall-fix
+
+log "Docker firewall fix script created"
+
+# Apply DOCKER-USER rules if Docker is installed
+if command -v docker >/dev/null 2>&1; then
+  if systemctl is-active --quiet docker 2>/dev/null; then
+    warn "Root Docker is running. Applying DOCKER-USER rules..."
+    /usr/local/bin/docker-firewall-fix
+    log "DOCKER-USER rules applied"
+  else
+    warn "Docker installed but not running. Rules will apply when Docker starts."
+  fi
+else
+  warn "Docker not yet installed. Run docker-firewall-fix after installing Docker."
+fi
+
+# Setup rootless Docker for ralph user (RECOMMENDED)
+echo ""
+echo "Setting up rootless Docker for ralph user..."
+echo "(Rootless Docker cannot modify system iptables - provides natural isolation)"
+
+if command -v curl >/dev/null 2>&1; then
+  # Check if rootless Docker is already installed
+  if su - $RALPH_USER -c "docker ps" >/dev/null 2>&1; then
+    log "Rootless Docker already configured for $RALPH_USER"
+  else
+    log "Installing rootless Docker for $RALPH_USER..."
+
+    # Install prerequisites
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get install -y uidmap dbus-user-session fuse-overlayfs slirp4netns 2>/dev/null || true
+    fi
+
+    # Install rootless Docker
+    su - $RALPH_USER -c 'curl -fsSL https://get.docker.com/rootless | sh' || {
+      warn "Rootless Docker installation failed. You can install it manually later:"
+      warn "  su - $RALPH_USER"
+      warn "  curl -fsSL https://get.docker.com/rootless | sh"
+    }
+
+    # Configure environment
+    su - $RALPH_USER <<'EOF'
+if ! grep -q "DOCKER_HOST" ~/.bashrc 2>/dev/null; then
+  cat >> ~/.bashrc <<'BASHRC'
+# Rootless Docker
+export PATH=$HOME/bin:$PATH
+export DOCKER_HOST=unix:///run/user/$(id -u)/docker.sock
+BASHRC
+  source ~/.bashrc
+
+  # Enable and start service
+  systemctl --user enable docker 2>/dev/null || true
+  systemctl --user start docker 2>/dev/null || true
+fi
+EOF
+
+    log "Rootless Docker configured for $RALPH_USER"
+  fi
+else
+  warn "curl not available. Install manually after setup."
+fi
+
+# Create systemd service to apply Docker firewall rules on boot
+cat > /etc/systemd/system/docker-firewall.service <<'EOF'
+[Unit]
+Description=Docker Firewall Rules (DOCKER-USER chain)
+After=docker.service
+Requires=docker.service
+ConditionPathExists=/usr/local/bin/docker-firewall-fix
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/docker-firewall-fix
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable docker-firewall 2>/dev/null || true
+
+log "Docker firewall service created and enabled"
+
+# ============================================================================
 # STEP 5: Resource Limits (cgroups)
 # ============================================================================
 
@@ -504,20 +642,30 @@ echo "  ✅ Sudo restrictions (limited commands only)"
 echo "  ✅ Resource limits (CPU 80%, RAM 12GB)"
 echo "  ✅ Workspace validation"
 echo "  ✅ Emergency kill switch"
+echo "  ✅ Docker firewall fix (DOCKER-USER chain)"
+echo "  ✅ Rootless Docker for $RALPH_USER"
 echo ""
 echo "⚠️  Manual Steps Required:"
 echo "  1. Review and apply firewall rules:"
 echo "     /usr/local/bin/ralph-firewall"
 echo ""
-echo "  2. Install Ralph for the ralph user:"
+echo "  2. Review Docker firewall rules (CRITICAL):"
+echo "     nano /usr/local/bin/docker-firewall-fix  # Customize networks"
+echo "     /usr/local/bin/docker-firewall-fix       # Apply rules"
+echo ""
+echo "  3. Verify Docker firewall:"
+echo "     iptables -L DOCKER-USER -n -v"
+echo "     su - $RALPH_USER -c 'docker ps'  # Test rootless Docker"
+echo ""
+echo "  4. Install Ralph for the ralph user:"
 echo "     su - $RALPH_USER"
 echo "     curl -fsSL https://raw.githubusercontent.com/agrimsingh/ralph-wiggum-opencode/main/install.sh | bash"
 echo ""
-echo "  3. Create a test project:"
+echo "  5. Create a test project:"
 echo "     mkdir -p $WORKSPACE_BASE/test-project"
 echo "     chown $RALPH_USER:$RALPH_USER $WORKSPACE_BASE/test-project"
 echo ""
-echo "  4. Configure RALPH_TASK.md in your project workspace"
+echo "  6. Configure RALPH_TASK.md in your project workspace"
 echo ""
 echo "Usage:"
 echo "  ralph-run <project-name>"
